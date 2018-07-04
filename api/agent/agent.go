@@ -71,7 +71,7 @@ import (
 type Agent interface {
 	// GetCall will return a Call that is executable by the Agent, which
 	// can be built via various CallOpt's provided to the method.
-	GetCall(...CallOpt) (Call, error)
+	GetCall(ctx context.Context, opts ...CallOpt) (Call, error)
 
 	// Submit will attempt to execute a call locally, a Call may store information
 	// about itself in its Start and End methods, which will be called in Submit
@@ -79,7 +79,7 @@ type Agent interface {
 	// will be returned if there is an issue executing the call or the error
 	// may be from the call's execution itself (if, say, the container dies,
 	// or the call times out).
-	Submit(Call) error
+	Submit(ctx context.Context, call Call) error
 
 	// Close will wait for any outstanding calls to complete and then exit.
 	// Closing the agent will invoke Close on the underlying DataAccess.
@@ -90,7 +90,7 @@ type Agent interface {
 }
 
 type agent struct {
-	cfg           AgentConfig
+	cfg           Config
 	da            CallHandler
 	callListeners []fnext.CallListener
 
@@ -111,13 +111,13 @@ type agent struct {
 	onStartup []func()
 }
 
-// AgentOption configures an agent at startup
-type AgentOption func(*agent) error
+// Option configures an agent at startup
+type Option func(*agent) error
 
 // New creates an Agent that executes functions locally as Docker containers.
-func New(da CallHandler, options ...AgentOption) Agent {
+func New(da CallHandler, options ...Option) Agent {
 
-	cfg, err := NewAgentConfig()
+	cfg, err := NewConfig()
 	if err != nil {
 		logrus.WithError(err).Fatalf("error in agent config cfg=%+v", cfg)
 	}
@@ -162,7 +162,7 @@ func (a *agent) addStartup(sup func()) {
 }
 
 // WithAsync Enables Async  operations on the agent
-func WithAsync(dqda DequeueDataAccess) AgentOption {
+func WithAsync(dqda DequeueDataAccess) Option {
 	return func(a *agent) error {
 		if !a.shutWg.AddSession(1) {
 			logrus.Fatalf("cannot start agent, unable to add session")
@@ -173,7 +173,9 @@ func WithAsync(dqda DequeueDataAccess) AgentOption {
 		return nil
 	}
 }
-func WithConfig(cfg *AgentConfig) AgentOption {
+
+// WithConfig configures an agent with the provided config.
+func WithConfig(cfg *Config) Option {
 	return func(a *agent) error {
 		a.cfg = *cfg
 		return nil
@@ -181,7 +183,7 @@ func WithConfig(cfg *AgentConfig) AgentOption {
 }
 
 // WithDockerDriver Provides a customer driver to agent
-func WithDockerDriver(drv drivers.Driver) AgentOption {
+func WithDockerDriver(drv drivers.Driver) Option {
 	return func(a *agent) error {
 		if a.driver != nil {
 			return errors.New("cannot add driver to agent, driver already exists")
@@ -193,7 +195,7 @@ func WithDockerDriver(drv drivers.Driver) AgentOption {
 }
 
 // WithCallOverrider registers register a CallOverrider to modify a Call and extensions on call construction
-func WithCallOverrider(fn CallOverrider) AgentOption {
+func WithCallOverrider(fn CallOverrider) Option {
 	return func(a *agent) error {
 		if a.callOverrider != nil {
 			return errors.New("lb-agent call overriders already exists")
@@ -204,8 +206,8 @@ func WithCallOverrider(fn CallOverrider) AgentOption {
 }
 
 // NewDockerDriver creates a default docker driver from agent config
-func NewDockerDriver(cfg *AgentConfig) (drivers.Driver, error) {
-	return drivers.New("docker", drivers.Config{
+func NewDockerDriver(cfg *Config) *docker.DockerDriver {
+		return drivers.New("docker", drivers.Config{
 		DockerNetworks:       cfg.DockerNetworks,
 		ServerVersion:        cfg.MinDockerVersion,
 		PreForkPoolSize:      cfg.PreForkPoolSize,
@@ -234,16 +236,17 @@ func (a *agent) Close() error {
 	return err
 }
 
-func (a *agent) Submit(callI Call) error {
+func (a *agent) Submit(ctx context.Context, callI Call) error {
 	if !a.shutWg.AddSession(1) {
 		return models.ErrCallTimeoutServerBusy
 	}
 
 	call := callI.(*call)
-
-	ctx := call.req.Context()
 	ctx, span := trace.StartSpan(ctx, "agent_submit")
 	defer span.End()
+
+	// XXX(reed): surface fnid,trigid, rid of route
+	ctx, _ = common.LoggerWithFields(ctx, logrus.Fields{"id": call.ID, "app_id": call.AppID, "route": call.Path})
 
 	err := a.submit(ctx, call)
 	return err
@@ -743,7 +746,7 @@ func (s *hotSlot) exec(ctx context.Context, call *call) error {
 
 	errApp := make(chan error, 1)
 	go func() {
-		ci := protocol.NewCallInfo(call.IsCloudEvent, call.Call, call.req.WithContext(ctx))
+		ci := protocol.NewCallInfo(ctx, call.IsCloudEvent, call.Call)
 		errApp <- proto.Dispatch(ctx, ci, call.w)
 	}()
 
@@ -796,7 +799,7 @@ func (a *agent) prepCold(ctx context.Context, call *call, tok ResourceToken, ch 
 		cpus:    uint64(call.CPUs),
 		fsSize:  a.cfg.MaxFsSize,
 		timeout: time.Duration(call.Timeout) * time.Second, // this is unnecessary, but in case removal fails...
-		stdin:   call.req.Body,
+		stdin:   call.RequestBody(),
 		stdout:  common.NewClampWriter(call.w, a.cfg.MaxResponseSize, models.ErrFunctionResponseTooBig),
 		stderr:  call.stderr,
 		stats:   &call.Stats,
@@ -1016,7 +1019,7 @@ type container struct {
 }
 
 //newHotContainer creates a container that can be used for multiple sequential events
-func newHotContainer(ctx context.Context, call *call, cfg *AgentConfig) (*container, func()) {
+func newHotContainer(ctx context.Context, call *call, cfg *Config) (*container, func()) {
 	// if freezer is enabled, be consistent with freezer behavior and
 	// block stdout and stderr between calls.
 	isBlockIdleIO := MaxDisabledMsecs != cfg.FreezeIdle
