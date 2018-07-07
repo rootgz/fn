@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -29,7 +30,7 @@ import (
 var tmpDatastoreTests = "/tmp/func_test_datastore.db"
 
 func testServer(ds models.Datastore, mq models.MessageQueue, logDB models.LogStore, rnr agent.Agent, nodeType NodeType, opts ...Option) *Server {
-	return New(context.Background(),
+	return New(context.Background(), append(opts,
 		WithLogLevel(getEnv(EnvLogLevel, DefaultLogLevel)),
 		WithDatastore(ds),
 		WithMQ(mq),
@@ -37,7 +38,7 @@ func testServer(ds models.Datastore, mq models.MessageQueue, logDB models.LogSto
 		WithAgent(rnr),
 		WithType(nodeType),
 		WithTriggerAnnotator(NewRequestBasedTriggerAnnotator()),
-	)
+	)...)
 }
 
 func createRequest(t *testing.T, method, path string, body io.Reader) *http.Request {
@@ -136,11 +137,11 @@ func TestFullStack(t *testing.T) {
 
 	srv := testServer(ds, &mqs.Mock{}, logDB, rnr, ServerTypeFull, LimitRequestBody(32256))
 
-	var bigbufa [65536]byte
+	var bigbufa [32257]byte
 	rand.Read(bigbufa[:])
+	bigbuf := base64.StdEncoding.EncodeToString(bigbufa[:]) // this will be > bigbufa, but json compatible
 	toobigerr := errors.New("Content-Length too large for this server")
-
-	bigbuf := append([]byte(`{"app":{"`), bigbufa[:]...)
+	gatewayerr := errors.New("container exit code")
 
 	for _, test := range []struct {
 		name              string
@@ -162,15 +163,17 @@ func TestFullStack(t *testing.T) {
 		{"get all routes", "GET", "/v1/apps/myapp/routes", ``, http.StatusOK, 0, nil},
 		{"execute myroute", "POST", "/r/myapp/myroute", `{ "echoContent": "Teste" }`, http.StatusOK, 1, nil},
 
+		// fails
+		{"execute myroute2", "POST", "/r/myapp/myroute2", `{"sleepTime": 0, "isDebug": true, "isCrash": true}`, http.StatusBadGateway, 2, gatewayerr},
+		{"request body too large", "POST", "/r/myapp/myroute", bigbuf, http.StatusRequestEntityTooLarge, 0, toobigerr},
+
 		{"get myroute2", "GET", "/v1/apps/myapp/routes/myroute2", ``, http.StatusOK, 2, nil},
 		{"delete myroute", "DELETE", "/v1/apps/myapp/routes/myroute", ``, http.StatusOK, 1, nil},
 		{"delete myroute2", "DELETE", "/v1/apps/myapp/routes/myroute2", ``, http.StatusOK, 0, nil},
 		{"delete app (success)", "DELETE", "/v1/apps/myapp", ``, http.StatusOK, 0, nil},
 
-		{"execute myroute2", "POST", "/r/myapp/myroute2", `{"sleepTime": 0, "isDebug": true, "isCrash": true}`, http.StatusBadGateway, 2, nil},
 		{"get deleted app", "GET", "/v1/apps/myapp", ``, http.StatusNotFound, 0, models.ErrAppsNotFound},
 		{"get deleteds route on deleted app", "GET", "/v1/apps/myapp/routes/myroute", ``, http.StatusNotFound, 0, models.ErrAppsNotFound},
-		{"request body too large", "POST", "/v1/apps", string(bigbuf[:]), http.StatusBadRequest, 0, toobigerr},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, rec := routerRequest(t, srv.Router, test.method, test.path, bytes.NewBuffer([]byte(test.body)))
