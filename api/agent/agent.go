@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/fnproject/fn/api/agent/drivers"
+	"github.com/fnproject/fn/api/agent/drivers/docker"
 	"github.com/fnproject/fn/api/agent/protocol"
 	"github.com/fnproject/fn/api/common"
 	"github.com/fnproject/fn/api/id"
@@ -207,7 +208,7 @@ func WithCallOverrider(fn CallOverrider) Option {
 
 // NewDockerDriver creates a default docker driver from agent config
 func NewDockerDriver(cfg *Config) *docker.DockerDriver {
-		return drivers.New("docker", drivers.Config{
+	return drivers.New("docker", drivers.Config{
 		DockerNetworks:       cfg.DockerNetworks,
 		ServerVersion:        cfg.MinDockerVersion,
 		PreForkPoolSize:      cfg.PreForkPoolSize,

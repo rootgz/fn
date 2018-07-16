@@ -219,6 +219,8 @@ type err struct {
 
 func (e err) Code() int { return e.code }
 
+var _ APIError = &err{}
+
 func NewAPIError(code int, e error) APIError { return err{code, e} }
 
 func IsAPIError(e error) bool {
