@@ -13,8 +13,10 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"bytes"
 	pb "github.com/fnproject/fn/api/agent/grpc"
 	"github.com/fnproject/fn/api/common"
+	"github.com/fnproject/fn/api/event"
 	"github.com/fnproject/fn/api/models"
 	pool "github.com/fnproject/fn/api/runnerpool"
 	"github.com/fnproject/fn/grpcutil"
@@ -103,23 +105,30 @@ func isTooBusy(err error) bool {
 	return false
 }
 
+type resultOrErr struct {
+	result []byte
+	err    error
+}
+
 // implements Runner
-func (r *gRPCRunner) TryExec(ctx context.Context, call pool.RunnerCall) (bool, error) {
+func (r *gRPCRunner) TryExec(ctx context.Context, call pool.RunnerCall) (*event.Event, bool, error) {
 	log := common.Logger(ctx).WithField("runner_addr", r.address)
 
 	log.Debug("Attempting to place call")
 	if !r.shutWg.AddSession(1) {
 		// try another runner if this one is closed.
-		return false, ErrorRunnerClosed
+		return nil, false, ErrorRunnerClosed
 	}
 	defer r.shutWg.DoneSession()
 
 	// extract the call's model data to pass on to the pure runner
-	modelJSON, err := json.Marshal(call.Model())
+	m := *call.Model()
+
+	modelJSON, err := json.Marshal(&m)
 	if err != nil {
 		log.WithError(err).Error("Failed to encode model as JSON")
 		// If we can't encode the model, no runner will ever be able to run this. Give up.
-		return true, err
+		return nil, true, err
 	}
 
 	rid := common.RequestIDFromContext(ctx)
@@ -132,7 +141,7 @@ func (r *gRPCRunner) TryExec(ctx context.Context, call pool.RunnerCall) (bool, e
 	if err != nil {
 		log.WithError(err).Error("Unable to create client to runner node")
 		// Try on next runner
-		return false, err
+		return nil, false, err
 	}
 
 	err = runnerConnection.Send(&pb.ClientMsg{Body: &pb.ClientMsg_Try{Try: &pb.TryCall{
@@ -143,32 +152,48 @@ func (r *gRPCRunner) TryExec(ctx context.Context, call pool.RunnerCall) (bool, e
 	if err != nil {
 		log.WithError(err).Error("Failed to send message to runner node")
 		// Try on next runner
-		return false, err
+		return nil, false, err
 	}
 
 	// After this point TryCall was sent, we assume "COMMITTED" unless pure runner
 	// send explicit NACK
+	// TODO buff pool /can stream JSON write directly to client?
+	bodyBuffer := &bytes.Buffer{}
+	json.NewEncoder(bodyBuffer).Encode(call.Model().InputEvent)
+	if err != nil {
+		return nil, false, err
+	}
 
-	recvDone := make(chan error, 1)
+	recvDone := make(chan resultOrErr, 1)
 
 	go receiveFromRunner(ctx, runnerConnection, call, recvDone)
-	go sendToRunner(ctx, runnerConnection, call)
+
+	go sendToRunner(ctx, runnerConnection, bytes.NewReader(bodyBuffer.Bytes()))
 
 	select {
 	case <-ctx.Done():
 		log.Infof("Engagement Context ended ctxErr=%v", ctx.Err())
-		return true, ctx.Err()
-	case recvErr := <-recvDone:
-		if isTooBusy(recvErr) {
+		return nil, true, ctx.Err()
+	case recvResult := <-recvDone:
+		if isTooBusy(recvResult.err) {
 			// Try on next runner
-			return false, models.ErrCallTimeoutServerBusy
+			return nil, false, models.ErrCallTimeoutServerBusy
 		}
-		return true, recvErr
+		if recvResult.err != nil {
+			return nil, false, recvResult.err
+		}
+
+		var evt event.Event
+		err = json.NewDecoder(bytes.NewReader(recvResult.result)).Decode(&evt)
+		if err != nil {
+			return nil, false, err
+		}
+		return &evt, false, nil
 	}
 }
 
-func sendToRunner(ctx context.Context, protocolClient pb.RunnerProtocol_EngageClient, call pool.RunnerCall) {
-	bodyReader := call.RequestBody()
+func sendToRunner(ctx context.Context, protocolClient pb.RunnerProtocol_EngageClient, bodyReader io.Reader) {
+
 	writeBuffer := make([]byte, MaxDataChunk)
 
 	log := common.Logger(ctx)
@@ -181,7 +206,7 @@ func sendToRunner(ctx context.Context, protocolClient pb.RunnerProtocol_EngageCl
 		// WARNING: blocking read.
 		n, err := bodyReader.Read(writeBuffer)
 		if err != nil && err != io.EOF {
-			log.WithError(err).Error("Failed to receive data from http client body")
+			log.WithError(err).Error("Failed to receive data from client")
 		}
 
 		// any IO error or n == 0 is an EOF for pure-runner
@@ -223,9 +248,9 @@ func parseError(msg *pb.CallFinished) error {
 	return models.NewAPIError(int(eCode), errors.New(eStr))
 }
 
-func tryQueueError(err error, done chan error) {
+func tryQueueError(err error, done chan resultOrErr) {
 	select {
-	case done <- err:
+	case done <- resultOrErr{err: err}:
 	default:
 	}
 }
@@ -253,8 +278,9 @@ func recordFinishStats(ctx context.Context, msg *pb.CallFinished) {
 	}
 }
 
-func receiveFromRunner(ctx context.Context, protocolClient pb.RunnerProtocol_EngageClient, c pool.RunnerCall, done chan error) {
-	w := c.ResponseWriter()
+func receiveFromRunner(ctx context.Context, protocolClient pb.RunnerProtocol_EngageClient, c pool.RunnerCall, done chan resultOrErr) {
+	w := &bytes.Buffer{}
+
 	defer close(done)
 
 	log := common.Logger(ctx)
@@ -274,20 +300,9 @@ DataLoop:
 		// Process HTTP header/status message. This may not arrive depending on
 		// pure runners behavior. (Eg. timeout & no IO received from function)
 		case *pb.RunnerMsg_ResultStart:
-			switch meta := body.ResultStart.Meta.(type) {
-			case *pb.CallResultStart_Http:
-				log.Debugf("Received meta http result from runner Status=%v", meta.Http.StatusCode)
-				for _, header := range meta.Http.Headers {
-					w.Header().Set(header.Key, header.Value)
-				}
-				if meta.Http.StatusCode > 0 {
-					w.WriteHeader(int(meta.Http.StatusCode))
-				}
-			default:
-				log.Errorf("Unhandled meta type in start message: %v", meta)
-			}
+			log.Debugf("Received ResultStart runner")
 
-		// May arrive if function has output. We ignore EOF.
+			// May arrive if function has output. We ignore EOF.
 		case *pb.RunnerMsg_Data:
 			log.Debugf("Received data from runner len=%d isEOF=%v", len(body.Data.Data), body.Data.Eof)
 			if !isPartialWrite {
@@ -303,7 +318,7 @@ DataLoop:
 				}
 			}
 
-		// Finish messages required for finish/finalize the processing.
+			// Finish messages required for finish/finalize the processing.
 		case *pb.RunnerMsg_Finished:
 			log.Infof("Call finished Success=%v %v", body.Finished.Success, body.Finished.Details)
 			recordFinishStats(ctx, body.Finished)

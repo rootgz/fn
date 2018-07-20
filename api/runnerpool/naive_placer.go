@@ -8,6 +8,7 @@ import (
 	"github.com/fnproject/fn/api/common"
 	"github.com/fnproject/fn/api/models"
 
+	"github.com/fnproject/fn/api/event"
 	"github.com/sirupsen/logrus"
 	"go.opencensus.io/stats"
 )
@@ -26,7 +27,7 @@ func NewNaivePlacer() Placer {
 	}
 }
 
-func (sp *naivePlacer) PlaceCall(rp RunnerPool, ctx context.Context, call RunnerCall) error {
+func (sp *naivePlacer) PlaceCall(rp RunnerPool, ctx context.Context, call RunnerCall) (*event.Event, error) {
 
 	tracker := newAttemptTracker(ctx)
 	log := common.Logger(ctx)
@@ -38,7 +39,7 @@ OutTries:
 			log.WithError(err).Error("Failed to find runners for call")
 			stats.Record(ctx, errorPoolCountMeasure.M(0))
 			tracker.finalizeAttempts(false)
-			return err
+			return nil, err
 		}
 
 		for j := 0; j < len(runners); j++ {
@@ -51,7 +52,7 @@ OutTries:
 
 			tracker.recordAttempt()
 			tryCtx, tryCancel := context.WithCancel(ctx)
-			placed, err := r.TryExec(tryCtx, call)
+			outevt, placed, err := r.TryExec(tryCtx, call)
 			tryCancel()
 
 			// Only log unusual (except for too-busy) errors
@@ -62,11 +63,11 @@ OutTries:
 			if placed {
 				if err != nil {
 					stats.Record(ctx, placedErrorCountMeasure.M(0))
-				} else {
-					stats.Record(ctx, placedOKCountMeasure.M(0))
+					tracker.finalizeAttempts(true)
+					return nil, err
 				}
-				tracker.finalizeAttempts(true)
-				return err
+				stats.Record(ctx, placedOKCountMeasure.M(0))
+				return outevt, err
 			}
 
 			// Too Busy is super common case, we track it separately
@@ -92,5 +93,5 @@ OutTries:
 	// Cancel Exit Path / Client cancelled/timedout
 	stats.Record(ctx, cancelCountMeasure.M(0))
 	tracker.finalizeAttempts(false)
-	return models.ErrCallTimeoutServerBusy
+	return nil, models.ErrCallTimeoutServerBusy
 }

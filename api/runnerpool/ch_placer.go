@@ -11,6 +11,7 @@ import (
 	"github.com/fnproject/fn/api/models"
 
 	"github.com/dchest/siphash"
+	"github.com/fnproject/fn/api/event"
 	"github.com/sirupsen/logrus"
 	"go.opencensus.io/stats"
 )
@@ -29,13 +30,13 @@ func NewCHPlacer() Placer {
 // This borrows the CH placement algorithm from the original FNLB.
 // Because we ask a runner to accept load (queuing on the LB rather than on the nodes), we don't use
 // the LB_WAIT to drive placement decisions: runners only accept work if they have the capacity for it.
-func (p *chPlacer) PlaceCall(rp RunnerPool, ctx context.Context, call RunnerCall) error {
+func (p *chPlacer) PlaceCall(rp RunnerPool, ctx context.Context, call RunnerCall) (*event.Event, error) {
 
 	tracker := newAttemptTracker(ctx)
 	log := common.Logger(ctx)
 
 	// The key is just the path in this case
-	key := call.Model().Path
+	key := call.Model().InputEvent.Source
 	sum64 := siphash.Hash(0, 0x4c617279426f6174, []byte(key))
 
 OutTries:
@@ -45,7 +46,7 @@ OutTries:
 			log.WithError(err).Error("Failed to find runners for call")
 			stats.Record(ctx, errorPoolCountMeasure.M(0))
 			tracker.finalizeAttempts(false)
-			return err
+			return nil, err
 		}
 
 		i := int(jumpConsistentHash(sum64, int32(len(runners))))
@@ -58,7 +59,7 @@ OutTries:
 
 			tracker.recordAttempt()
 			tryCtx, tryCancel := context.WithCancel(ctx)
-			placed, err := r.TryExec(tryCtx, call)
+			respEvt, placed, err := r.TryExec(tryCtx, call)
 			tryCancel()
 
 			// Only log unusual (except for too-busy) errors
@@ -69,11 +70,13 @@ OutTries:
 			if placed {
 				if err != nil {
 					stats.Record(ctx, placedErrorCountMeasure.M(0))
-				} else {
-					stats.Record(ctx, placedOKCountMeasure.M(0))
+					tracker.finalizeAttempts(true)
+					return nil, err
 				}
+
+				stats.Record(ctx, placedOKCountMeasure.M(0))
 				tracker.finalizeAttempts(true)
-				return err
+				return respEvt, nil
 			}
 
 			i = (i + 1) % len(runners)
@@ -101,7 +104,7 @@ OutTries:
 	// Cancel Exit Path / Client cancelled/timedout
 	stats.Record(ctx, cancelCountMeasure.M(0))
 	tracker.finalizeAttempts(false)
-	return models.ErrCallTimeoutServerBusy
+	return nil, models.ErrCallTimeoutServerBusy
 }
 
 // A Fast, Minimal Memory, Consistent Hash Algorithm:
